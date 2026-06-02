@@ -53,6 +53,27 @@ makes the pipeline faster, more reliable, and safer to operate trackside.
 - `QueryBuilder` already centralizes DB access — we extend it, not replace it.
 - Kafka already exists and is genuinely good at being a durable replay bus.
 
+### Deployment reality (drives every sizing decision below)
+
+The whole stack runs on **one machine**: a Dell Precision **tower workstation,
+~64 GB RAM, NVMe/SSD**. Everything — ingest, Postgres, Kafka + the Go bridge,
+Grafana, processors — is co-located on it. The **only** remote component is the
+**MQTT broker** (AWS, via `AWS_MQTT_IP`); the car publishes there and the tower
+subscribes.
+
+Consequences:
+
+- The enemy is **resource contention on one box**, not network/multi-node
+  scaling. "Load balancing" here means **isolating reads off the write path
+  *inside one machine***, not spreading across nodes.
+- With **64 GB + NVMe** there is generous headroom: we can run Redis (Tier 0) and
+  TimescaleDB (Tier 1/2) **alongside** the existing Kafka bus without starving it.
+  64 GB is enough that the OS page cache keeps warm Postgres/Timescale chunks in
+  RAM, and NVMe makes hypertable writes + compression cheap.
+- **Decision: keep Kafka as the durable bus** (the Go bridge + Grafana Kafka
+  datasource stay). The box can afford the JVM, and reusing the wired-up path
+  beats a rewrite. We add Redis + Timescale around it rather than replacing it.
+
 ### Pain points this plan addresses
 
 | # | Problem (observed in code) | Impact |
@@ -266,17 +287,42 @@ These are worth doing regardless and several fall out of the architecture above:
 
 ---
 
-## 6. Load balancing
+## 6. Single-box resource isolation & budgeting (64 GB / NVMe)
 
-- **Write scaling:** Kafka topic partitioned by `car` (and optionally
-  table-group). Run **N stateless ingest producers** and **N warm-sink consumers**
-  in a consumer group → horizontal write throughput, rolling restarts with no
-  data loss.
-- **Read scaling:** Tier 0 Redis pub/sub fans one live stream to many dashboard
-  clients; Tier 2/3 served by a **Postgres/Timescale read replica** + **PgBouncer**
-  connection pooling so retrospect/analysis never contends with ingest.
-- **Router-level balancing:** `TelemetryStore._route` sends each query to the
-  cheapest capable tier, which is itself load distribution across engines.
+This is **one tower**, so "load balancing" = isolating reads from writes *inside
+the box* and giving each engine a bounded slice of RAM so nothing starves Kafka
+or Postgres. The tiering does the isolation; explicit memory caps keep the peace.
+
+**Read isolation (the actual win):**
+- Tier 0 **Redis pub/sub** fans one live stream to every dashboard/viewer client,
+  so N live panels = ~1 source, **zero** Postgres hits for live data.
+- Retrospect/analysis read **Timescale continuous-aggregate rollups** (tiny) +
+  NVMe-backed page cache instead of scanning raw chunks → they stop contending
+  with ingest.
+- **PgBouncer** in front of Postgres caps connection/backend sprawl from Grafana
+  + notebooks + the live viewer.
+- A full **streaming read replica is *not* needed at this scale** — it would
+  double write I/O and storage on the same disk for little gain. Revisit only if
+  rollups + Redis don't fully de-contend; the box has the RAM/NVMe to add one
+  later if ever required.
+
+**Rough memory budget (64 GB, leave headroom for OS page cache):**
+
+| Component | Suggested cap | Notes |
+|---|---|---|
+| Postgres/Timescale `shared_buffers` | ~16 GB | + rely on OS page cache for the rest (NVMe) |
+| Postgres `work_mem` / `maintenance_work_mem` | tuned | compression/rollup jobs |
+| Redis `maxmemory` | 4–8 GB | `allkeys-lru` or stream `MAXLEN` caps the rings |
+| Kafka JVM heap | 4–6 GB | bus only; short retention on `sensor_data` |
+| Grafana + bridge + ingest + processors | ~4–6 GB total | mostly light |
+| **OS page cache (unallocated)** | **~20 GB+** | keeps warm chunks hot → fast Tier 2 reads |
+
+- **Write scaling** is a non-issue at our Hz on NVMe; we do **not** need multiple
+  ingest/consumer replicas. Kafka stays single-broker, partitioned by `car` only
+  for clean per-car ordering/replay — not for throughput.
+- **Router-level balancing:** `TelemetryStore._route` still sends each query to
+  the cheapest capable tier — on one box that's about *which engine's buffer pool
+  absorbs the work*, keeping the hot path off Postgres entirely.
 
 ---
 
@@ -315,15 +361,21 @@ and still have banked a concrete win.
 
 ---
 
-## 8. Open questions for the team
+## 8. Decisions & open questions
 
-- Trackside deployment is a single box (`net_configs.json` → `localhost` /
-  `lhrelectric.org`). Is multi-node load balancing actually needed, or is the goal
-  single-box **read isolation** (Redis + Timescale rollups already deliver that)?
-- Acceptable hot-window horizon (`HOT_HORIZON`) and warm raw-retention before
-  rollup-only? Drives Redis `MAXLEN` and Timescale retention policy.
-- Keep the Go Kafka bridge, or collapse Tier 0 + bus onto **Redis Streams** and
-  retire Kafka/the bridge for a simpler stack?
+**Resolved (team input):**
+- **Deployment:** single Precision tower, ~64 GB RAM, NVMe; everything except the
+  (remote AWS) MQTT broker runs on it. → Goal is **single-box read isolation**, not
+  multi-node scaling. No read replica / consumer fan-out needed at this scale.
+- **Kafka stays** as the durable bus (Go bridge + Grafana Kafka datasource kept);
+  Redis + Timescale are added around it. The box has headroom for all three.
+
+**Still open (tunables, not blockers):**
+- Hot-window horizon (`HOT_HORIZON`, e.g. 30–120 s) → sets Redis stream `MAXLEN`.
+- Warm raw-retention before compress/rollup-only (e.g. keep raw 7–14 days on NVMe,
+  rollups indefinitely) → Timescale compression + retention policy.
+- Continuous-aggregate bucket sizes (1 s / 1 min?) to match the retrospect
+  dashboards' typical zoom levels.
 
 ---
 
