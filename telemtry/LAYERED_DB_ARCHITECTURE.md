@@ -379,7 +379,48 @@ and still have banked a concrete win.
 
 ---
 
-### TL;DR
+## 9. Consumer impact & migration (existing readers keep working)
+
+Two consumer classes, two stories. Because we **keep Kafka** and **TimescaleDB
+*is* Postgres**, almost nothing changes at the call site — same connection
+strings, same SQL, same Prisma/SQLAlchemy models, same SSE/Kafka topics. What
+changes is *which tier answers*, and that's mostly transparent.
+
+| Consumer (in this repo) | Reads today via | Change | Why |
+|---|---|---|---|
+| **Grafana — live** (`grafana-provisioning/real-time-kafka.yml` + Go `grafana-kafka-datasource`) | Kafka datasource plugin | **None** | Kafka stays the bus. |
+| **Grafana — historical** (`nightwatch/orion/angelique.yml` Postgres datasources) | Postgres DS, raw SQL | **Config only:** repoint zoomed-out panels at rollup views (`*_1s`, `*_1min`); raw tables for zoomed-in. Same host/DS. | Continuous aggregates → whole-session panels read tiny pre-bucketed tables. |
+| **Viewer — live** (`useKafkaStream` → `/api/kafka-stream` SSE → `lib/kafka/kafkaConsumer.ts` + `messageBuffer.ts`) | Browser already speaks **SSE**, not Kafka | **None at browser.** Server-side `messageBuffer` (the `history=latest\|all` buffer) gets backed by **Redis**. | Late-joining panels get instant last-N state; survives Next.js restarts / multiple instances. Hook API untouched. |
+| **Viewer — warm** (`handshake`, `replay`, `tune`, `dashboards` via Prisma `lib/prisma/telemtry` + raw `pg` Pool in `lib/db-telemetry.ts`) | Postgres `telemetry` @ `localhost:5432` | **Mostly none** (hypertables transparent to Prisma/pg). Hot lookups (handshake `findLatestPacketId`) move to **Redis**; heavy reads can target rollups. | Handshake stops doing a Postgres point-query per car connect (P5). |
+| **Car dash / any live display** | Live bus (Kafka/SSE) | **None** | Same live path as viewer. |
+| **Python analysis** (`analysis/sql_utils/query_builder.py`, `db_session.py`, notebooks, `validate_live_viewer.py`) | SQLAlchemy → Postgres | **None required.** Optionally route through `TelemetryStore` to auto-pick rollup vs raw. | Models/queries unchanged; router is opt-in sugar. |
+
+**The one honest caveat — Grafana can't call the router.** `TelemetryStore` is a
+library (Python, plus its TS twin in `lib/db-telemetry.ts` / the kafka lib).
+Grafana is a separate process with its own datasource plugins, so for Grafana the
+abstraction is realized *physically*: **live** → Kafka DS (unchanged),
+**historical** → Postgres DS pointed at rollup views, optional **hot gauges** →
+a Redis DS. Everything that runs *in our own code* gets the transparent router.
+
+**Shared routing contract** (same intent verbs in both runtimes, so a reader
+expresses *what* it wants, never *where*):
+
+```
+latest(car, fields)              -> Tier 0 (Redis last-value)        # gauges, banners, board-status, handshake
+last_n(car, fields, n)           -> Tier 0 ring, else Tier 1         # live sparklines
+window(car, fields, t0, t1, max) -> router picks hot/raw/rollup/cold # charts, replay, retrospect
+```
+
+- **Python:** `analysis/sql_utils/telemetry_store.py` (wraps `QueryBuilder`).
+- **TypeScript:** thin `lib/telemetry/store.ts` over the existing `pg` Pool +
+  a Redis client + the SSE buffer — exposing the *same three verbs*.
+
+**Consumer cutover happens late and is reversible.** Phases 0–1 are invisible to
+every consumer. Redis-backed `latest()`/handshake (Phase 2) and rollup repointing
+(Phase 3) are per-consumer, one at a time, each behind a feature flag / DS swap
+that can be reverted without touching the producer side.
+
+---
 
 Keep Postgres for what it's good at (Tier 2/3 SQL). Put a **`TelemetryStore`
 façade** in front of `QueryBuilder` that routes by data age + query shape to
